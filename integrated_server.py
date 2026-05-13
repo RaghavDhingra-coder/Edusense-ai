@@ -23,6 +23,8 @@ from face_detector import FaceDetector
 from image_manager import ImageManager
 from face_reid import FaceReID
 from hybrid_attentiveness import HybridAttentivenessAnalyzer
+from student_registry import StudentRegistry
+from face_reid_recognition import FaceReIDWithRecognition
 import config
 
 # Configure logging
@@ -34,7 +36,20 @@ logger = logging.getLogger(__name__)
 
 # Create Flask app
 app = Flask(__name__, static_folder='frontend', static_url_path='')
-CORS(app)  # Enable CORS
+
+# Configure CORS - SECURE: Only allow localhost origins
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:5000",
+            "http://127.0.0.1:5000"
+        ],
+        "methods": ["GET", "POST", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 # Configure upload settings
 UPLOAD_FOLDER = 'uploads'
@@ -52,6 +67,31 @@ camera_system = None
 camera_lock = threading.Lock()
 current_session_id = None
 video_processing_active = False
+
+# Student registry (global, persistent across sessions)
+student_registry = StudentRegistry(registry_dir='registered_students')
+logger.info(f"📚 Loaded {len(student_registry.students)} registered students")
+
+# Initialize InsightFace for the registry
+try:
+    import insightface
+    from insightface.app import FaceAnalysis
+    
+    logger.info("🔄 Initializing InsightFace for student registry...")
+    face_app = FaceAnalysis(
+        name='buffalo_s',
+        providers=['CPUExecutionProvider']
+    )
+    face_app.prepare(ctx_id=0, det_size=(160, 160))
+    
+    # Connect to registry
+    student_registry.set_face_app(face_app)
+    logger.info("✅ InsightFace initialized for student registry")
+    
+except Exception as e:
+    logger.error(f"⚠️  InsightFace initialization failed: {e}")
+    logger.warning("   Student registration will not work without InsightFace")
+    logger.warning("   Install with: pip3 install insightface onnxruntime")
 
 
 def generate_session_id(prefix="session"):
@@ -165,16 +205,18 @@ class CameraSystem:
             # Image manager - USE SESSION DIRECTORY
             self.image_manager = ImageManager(self.session_dir)
             
-            # ReID system - SAME AS main.py
+            # ReID system with Recognition - USE ENHANCED VERSION
             # NOTE: ReID will use persistent identity database if it exists
             if config.ENABLE_REID:
-                logger.info("🔄 Initializing Face Re-Identification...")
-                self.reid_system = FaceReID(
+                logger.info("🔄 Initializing Face Re-Identification with Recognition...")
+                self.reid_system = FaceReIDWithRecognition(
+                    student_registry=student_registry,
                     similarity_threshold=config.REID_SIMILARITY_THRESHOLD,
                     embedding_size=512
                 )
                 # Reset ReID session state (but keep persistent identity DB)
                 self.reid_system.reset_session()
+                logger.info(f"✅ Recognition enabled with {len(student_registry.students)} registered students")
             else:
                 logger.info("⚠️  Face ReID disabled")
                 self.reid_system = None
@@ -376,26 +418,41 @@ class CameraSystem:
             if face_crop is None:
                 continue
             
-            # Apply ReID - SAME AS main.py
+            # Apply ReID with Recognition
             if self.reid_system and config.ENABLE_REID:
-                should_extract = self.reid_system.should_extract_embedding(
-                    track_id, track_age, confidence
+                # FaceReIDWithRecognition returns: (identity_id, identity_name, is_new, confidence, is_registered)
+                identity_id, identity_name, is_new, confidence_score, is_registered = self.reid_system.register_or_match_face(
+                    track_id, face_crop, current_time, force_extract=False
                 )
                 
-                student_id, is_new, similarity = self.reid_system.register_or_match_face(
-                    track_id, face_crop, current_time, force_extract=should_extract
-                )
-                
-                if is_new and track_age == 0:
-                    logger.info(f"✨ New student: Student {student_id} (Track {track_id})")
+                # Handle recognition result
+                if is_registered:
+                    # Registered student recognized
+                    student_id = identity_id
+                    student_name = identity_name
+                    
+                    if is_new:
+                        logger.info(f"✅ Recognized: {student_name} (Track {track_id})")
+                    
+                    # ONLY save face image for registered students
+                    self.image_manager.save_face_image(frame, bbox, student_id, confidence)
+                    
+                    # Store for display with name
+                    reid_detections.append((x1, y1, x2, y2, student_id, confidence, student_name, True))
+                    
+                else:
+                    # Unknown person - SKIP analytics and storage
+                    student_name = identity_name  # "Unknown X"
+                    
+                    # Show in video feed but DON'T save or analyze
+                    # No call to save_face_image() for unknown persons
+                    reid_detections.append((x1, y1, x2, y2, track_id, confidence, student_name, False))
+                    
             else:
+                # No ReID - use track ID
                 student_id = track_id
-            
-            # Save face image - SAME AS main.py
-            self.image_manager.save_face_image(frame, bbox, student_id, confidence)
-            
-            # Store for display
-            reid_detections.append((x1, y1, x2, y2, student_id, confidence))
+                self.image_manager.save_face_image(frame, bbox, student_id, confidence)
+                reid_detections.append((x1, y1, x2, y2, student_id, confidence, f"Student {student_id}", True))
         
         # Handle lost tracks - SAME AS main.py
         if self.reid_system and config.ENABLE_REID:
@@ -417,14 +474,29 @@ class CameraSystem:
         return annotated_frame
     
     def _draw_detections(self, frame, detections):
-        """Draw bounding boxes and labels - SAME AS main.py"""
-        for x1, y1, x2, y2, student_id, confidence in detections:
+        """Draw bounding boxes and labels with student names"""
+        for detection in detections:
+            if len(detection) == 8:
+                # New format with recognition
+                x1, y1, x2, y2, student_id, confidence, student_name, is_registered = detection
+            else:
+                # Old format fallback
+                x1, y1, x2, y2, student_id, confidence = detection
+                student_name = f"Student {student_id}"
+                is_registered = True
+            
+            # Color coding: Green for registered, Orange for unknown
+            if is_registered:
+                color = (0, 255, 0)  # Green
+                label = student_name
+            else:
+                color = (0, 165, 255)  # Orange
+                label = "Unknown Person"
+            
             # Draw bounding box
-            color = (0, 255, 0)  # Green
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             
             # Draw label
-            label = f"Student {student_id}"
             label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             
             # Background for label
@@ -537,18 +609,18 @@ def get_camera_system():
 
 
 def generate_frames():
-    """Generate frames for MJPEG streaming"""
+    """Generate frames for MJPEG streaming - THREAD-SAFE"""
     frame_count = 0
     logger.info("[MJPEG] Stream generator started")
     
     while True:
-        # Use global camera_system directly - DO NOT call get_camera_system()
-        # Calling get_camera_system() would create a different instance
-        global camera_system
+        # Thread-safe access to camera_system
+        with camera_lock:
+            cam_sys = camera_system
         
         frame = None
-        if camera_system is not None:
-            frame = camera_system.get_frame()
+        if cam_sys is not None:
+            frame = cam_sys.get_frame()
         
         if frame is None:
             # Send placeholder frame
@@ -659,7 +731,7 @@ def start_camera():
 
 @app.route('/api/video/upload', methods=['POST'])
 def upload_video():
-    """Upload video file for processing"""
+    """Upload video file for processing with security validation"""
     try:
         logger.info("=" * 60)
         logger.info("📤 Video upload request received")
@@ -707,10 +779,17 @@ def upload_video():
         os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
         
         # Save file
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        filepath = os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], filename))
         logger.info(f"💾 Saving video to: {filepath}")
-        logger.info(f"📁 Upload folder: {app.config['UPLOAD_FOLDER']}")
-        logger.info(f"📁 Absolute path: {os.path.abspath(filepath)}")
+        
+        # Security: Validate filepath is within upload folder
+        upload_folder_abs = os.path.abspath(app.config['UPLOAD_FOLDER'])
+        if not filepath.startswith(upload_folder_abs):
+            logger.error(f"❌ Security: Path traversal attempt detected")
+            return jsonify({
+                'success': False,
+                'error': 'Invalid file path'
+            }), 400
         
         file.save(filepath)
         
@@ -722,9 +801,38 @@ def upload_video():
                 'error': 'Failed to save file'
             }), 500
         
-        # Get file size
+        # Validate file size
         file_size = os.path.getsize(filepath)
         file_size_mb = file_size / (1024 * 1024)
+        
+        if file_size > MAX_UPLOAD_SIZE:
+            os.remove(filepath)  # Clean up
+            logger.error(f"❌ File too large: {file_size_mb:.2f} MB")
+            return jsonify({
+                'success': False,
+                'error': f'File too large: {file_size_mb:.2f} MB (max: {MAX_UPLOAD_SIZE/(1024*1024)} MB)'
+            }), 400
+        
+        # Validate it's actually a video file (magic number check)
+        try:
+            import cv2
+            cap = cv2.VideoCapture(filepath)
+            if not cap.isOpened():
+                cap.release()
+                os.remove(filepath)  # Clean up invalid file
+                logger.error(f"❌ Not a valid video file")
+                return jsonify({
+                    'success': False,
+                    'error': 'File is not a valid video'
+                }), 400
+            cap.release()
+        except Exception as e:
+            os.remove(filepath)  # Clean up
+            logger.error(f"❌ Video validation failed: {e}")
+            return jsonify({
+                'success': False,
+                'error': 'Invalid video file'
+            }), 400
         
         logger.info(f"✅ Video uploaded successfully!")
         logger.info(f"   Filename: {filename}")
@@ -1192,6 +1300,155 @@ def get_stats():
     
     except Exception as e:
         logger.error(f"Failed to get stats: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+
+
+# ============================================================================
+# STUDENT REGISTRATION ENDPOINTS
+# ============================================================================
+
+@app.route('/api/students/register', methods=['POST'])
+def register_student():
+    """Register a new student with face images"""
+    try:
+        data = request.get_json()
+        
+        student_name = data.get('student_name')
+        student_id = data.get('student_id')
+        face_images_b64 = data.get('face_images', [])
+        
+        logger.info(f"📝 Registration request: {student_name} ({student_id})")
+        logger.info(f"   Images provided: {len(face_images_b64)}")
+        
+        # Decode base64 images
+        face_images = []
+        for idx, img_b64 in enumerate(face_images_b64):
+            try:
+                import base64
+                # Remove data:image/jpeg;base64, prefix if present
+                if ',' in img_b64:
+                    img_b64 = img_b64.split(',')[1]
+                
+                img_data = base64.b64decode(img_b64)
+                nparr = np.frombuffer(img_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is not None:
+                    face_images.append(img)
+                    logger.info(f"   ✅ Image {idx+1} decoded: {img.shape}")
+                else:
+                    logger.warning(f"   ⚠️  Image {idx+1} decode failed")
+            except Exception as e:
+                logger.error(f"   ❌ Image {idx+1} error: {e}")
+        
+        if len(face_images) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'No valid images provided'
+            }), 400
+        
+        # Register student
+        result = student_registry.register_student(student_name, student_id, face_images)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"❌ Registration error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/students/list', methods=['GET'])
+def list_students():
+    """Get list of all registered students"""
+    try:
+        students = student_registry.get_all_students()
+        return jsonify({
+            'success': True,
+            'students': students,
+            'count': len(students)
+        })
+    except Exception as e:
+        logger.error(f"❌ List students error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/students/delete/<student_id>', methods=['DELETE'])
+def delete_student(student_id):
+    """Delete a registered student"""
+    try:
+        result = student_registry.delete_student(student_id)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"❌ Delete student error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/students/capture', methods=['POST'])
+def capture_faces_from_camera():
+    """Capture face images from current camera feed for registration"""
+    try:
+        global camera_system
+        
+        if not camera_system or not camera_system.running:
+            return jsonify({
+                'success': False,
+                'error': 'Camera not running. Please start camera first.'
+            }), 400
+        
+        # Get number of captures
+        num_captures = request.json.get('num_captures', 10) if request.json else 10
+        captured_images = []
+        
+        logger.info(f"📸 Capturing {num_captures} face images from camera...")
+        
+        for i in range(num_captures):
+            frame = camera_system.get_frame()
+            if frame is not None:
+                # Detect faces
+                detections = camera_system.detector.detect_faces(frame)
+                if len(detections) > 0:
+                    # Get first face
+                    x1, y1, x2, y2, conf = detections[0]
+                    face_crop = camera_system.image_manager.crop_face(frame, (x1, y1, x2, y2))
+                    
+                    if face_crop is not None:
+                        # Encode to base64
+                        import base64
+                        _, buffer = cv2.imencode('.jpg', face_crop)
+                        img_b64 = base64.b64encode(buffer).decode('utf-8')
+                        captured_images.append(f"data:image/jpeg;base64,{img_b64}")
+                        logger.info(f"   ✅ Captured image {i+1}/{num_captures}")
+            
+            time.sleep(0.5)  # Wait between captures
+        
+        logger.info(f"✅ Captured {len(captured_images)} images")
+        
+        return jsonify({
+            'success': True,
+            'images': captured_images,
+            'count': len(captured_images)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ Capture error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)

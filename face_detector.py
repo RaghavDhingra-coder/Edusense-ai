@@ -7,23 +7,10 @@ import cv2
 import numpy as np
 import torch
 import os
+import warnings
 
-# Fix for PyTorch 2.6+ weights_only issue - add all required safe globals
-import torch.serialization
-try:
-    from ultralytics.nn.tasks import DetectionModel
-    from torch.nn.modules.container import Sequential
-    from torch.nn import Module
-    
-    # Add all required safe globals for model loading
-    torch.serialization.add_safe_globals([
-        DetectionModel,
-        Sequential,
-        Module,
-    ])
-except Exception as e:
-    print(f"⚠️  Could not add safe globals: {e}")
-    pass
+# Suppress PyTorch serialization warnings
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch.serialization')
 
 from ultralytics import YOLO
 import config
@@ -64,7 +51,7 @@ class FaceDetector:
         """
         Initialize YOLOv8-Face model for face detection
         Downloads from Hugging Face if not present
-        Uses weights_only=False for PyTorch 2.6+ compatibility
+        Uses weights_only=False for trusted models (PyTorch 2.6+ compatibility)
         """
         try:
             print(f"🔄 Loading YOLOv8-Face model...")
@@ -74,20 +61,25 @@ class FaceDetector:
                 try:
                     print(f"   Loading local model: {self.model_path}")
                     
-                    # For PyTorch 2.6+, we need to use weights_only=False for YOLO models
-                    # This is safe for models from trusted sources like Hugging Face
-                    import torch
+                    # SOLUTION: Patch torch.load to use weights_only=False for trusted models
+                    # This is safe because we control the model source (Hugging Face official)
                     original_load = torch.load
                     
-                    def safe_load(*args, **kwargs):
+                    def patched_load(*args, **kwargs):
+                        # Force weights_only=False for YOLO models (trusted source)
                         kwargs['weights_only'] = False
                         return original_load(*args, **kwargs)
                     
-                    torch.load = safe_load
-                    self.model = YOLO(self.model_path)
-                    torch.load = original_load
+                    # Temporarily patch torch.load
+                    torch.load = patched_load
                     
-                    print(f"✅ Loaded face detection model: {self.model_path}")
+                    try:
+                        self.model = YOLO(self.model_path)
+                        print(f"✅ Loaded face detection model: {self.model_path}")
+                    finally:
+                        # Restore original torch.load
+                        torch.load = original_load
+                    
                 except Exception as e:
                     print(f"⚠️  Could not load {self.model_path}: {str(e)}")
                     self.model = None
@@ -111,17 +103,19 @@ class FaceDetector:
                     
                     print(f"✅ Downloaded successfully")
                     
-                    # Load with weights_only=False
-                    import torch
+                    # Load model with patched torch.load
                     original_load = torch.load
                     
-                    def safe_load(*args, **kwargs):
+                    def patched_load(*args, **kwargs):
                         kwargs['weights_only'] = False
                         return original_load(*args, **kwargs)
                     
-                    torch.load = safe_load
-                    self.model = YOLO("yolov8n-face.pt")
-                    torch.load = original_load
+                    torch.load = patched_load
+                    
+                    try:
+                        self.model = YOLO("yolov8n-face.pt")
+                    finally:
+                        torch.load = original_load
                     
                     self.model_path = "yolov8n-face.pt"
                     print(f"✅ Loaded YOLOv8n-Face model")
