@@ -20,7 +20,7 @@ try:
     logger.info("🔄 Creating FaceAnalysis app...")
     face_app = FaceAnalysis(
         name='buffalo_s',
-        providers=['CPUExecutionProvider']
+        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
     )
     
     logger.info("🔄 Preparing model...")

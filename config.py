@@ -50,5 +50,5 @@ FPS_COLOR = (0, 0, 255)  # Red for FPS counter
 
 # Model Configuration - FACE DETECTION SPECIFIC
 YOLO_MODEL = "yolov8n-face.pt"  # YOLOv8 face detection model
-DEVICE = "cpu"  # Use "cuda:0" for GPU, "cpu" for CPU
-USE_HALF_PRECISION = False  # Use FP16 for faster inference on GPU (set False for CPU)
+DEVICE = "cuda:0"  # Use "cuda:0" for GPU, "cpu" for CPU
+USE_HALF_PRECISION = True  # Use FP16 for faster inference on GPU (set False for CPU)

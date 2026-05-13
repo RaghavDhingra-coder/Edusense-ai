@@ -55,7 +55,7 @@ class FolderCleanup:
             
             self.app = FaceAnalysis(
                 name='buffalo_s',
-                providers=['CPUExecutionProvider']
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
             self.app.prepare(ctx_id=0, det_size=(160, 160))
             

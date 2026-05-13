@@ -63,7 +63,7 @@ class FaceReID:
             # 'buffalo_s' is faster and good for classroom
             self.app = FaceAnalysis(
                 name='buffalo_s',
-                providers=['CPUExecutionProvider']  # Use CPU for compatibility
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
             
             # Prepare model with target size
@@ -124,7 +124,7 @@ class FaceReID:
             # 'buffalo_s' is faster and good for classroom
             self.app = FaceAnalysis(
                 name='buffalo_s',
-                providers=['CPUExecutionProvider']  # Use CPU for compatibility
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
             
             # Prepare model with target size

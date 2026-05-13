@@ -80,7 +80,7 @@ try:
     logger.info("🔄 Initializing InsightFace for student registry...")
     face_app = FaceAnalysis(
         name='buffalo_s',
-        providers=['CPUExecutionProvider']
+        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
     )
     face_app.prepare(ctx_id=0, det_size=(160, 160))
     
