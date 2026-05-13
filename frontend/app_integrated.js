@@ -41,6 +41,13 @@ let currentSessionId = null;
 let uploadedVideoPath = null;
 let sourceType = null; // 'webcam' or 'video'
 
+// Browser webcam state (cloud deployment — no VM webcam)
+let browserStream = null;       // MediaStream from getUserMedia
+let frameInterval = null;       // setInterval handle for frame sending
+let captureCanvas = null;       // hidden <canvas> for frame capture
+let captureCtx = null;          // 2D context of captureCanvas
+let localVideo = null;          // temporary <video> element to hold the stream
+
 // Debug function - can be called from browser console
 window.debugUploadState = function() {
     console.log('═══════════════════════════════════════════════════════');
@@ -123,51 +130,74 @@ function resetDashboard() {
 }
 
 /**
- * Start camera
+ * Start camera — uses browser getUserMedia and sends frames to backend.
+ * This works on both local machines and Google Cloud VMs (no VM webcam needed).
  */
 async function startCamera() {
     try {
-        console.log('🎥 Starting new camera session...');
+        console.log('🎥 Starting new camera session (browser webcam)...');
         startCameraBtn.disabled = true;
-        
+
         // Reset dashboard for new session
         resetDashboard();
-        
+
+        // 1. Ask backend to initialise a session (no cv2.VideoCapture on server)
         const response = await fetch(`${API_BASE_URL}/camera/start`, {
             method: 'POST'
         });
-        
+
         const data = await response.json();
-        
-        if (data.success) {
-            console.log('✅ Camera started');
-            console.log('📁 Session ID:', data.session_id);
-            console.log('📁 Session Dir:', data.session_dir);
-            
-            cameraRunning = true;
-            currentSessionId = data.session_id;
-            
-            // Update UI
-            startCameraBtn.style.display = 'none';
-            stopCameraBtn.style.display = 'inline-flex';
-            videoPlaceholder.style.display = 'none';
-            videoFeed.style.display = 'block';
-            videoStats.style.display = 'flex';
-            
-            // Start video stream
-            videoFeed.src = `${API_BASE_URL}/video_feed?t=${Date.now()}`;
-            
-            // Start stats polling
-            startStatsPolling();
-            
-            // Show success message
-            showNotification(`New session started: ${data.session_id}`, 'success');
-        } else {
-            throw new Error(data.error || 'Failed to start camera');
+
+        if (!data.success) {
+            throw new Error(data.error || 'Failed to start camera session');
         }
-        
+
+        console.log('✅ Backend session started:', data.session_id);
+        cameraRunning = true;
+        currentSessionId = data.session_id;
+
+        // 2. Open browser webcam
+        browserStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false
+        });
+
+        // 3. Set up hidden video element to feed the canvas
+        localVideo = document.createElement('video');
+        localVideo.srcObject = browserStream;
+        localVideo.setAttribute('playsinline', '');
+        localVideo.muted = true;
+        await localVideo.play();
+
+        // 4. Set up capture canvas (matches video dimensions)
+        captureCanvas = document.getElementById('captureCanvas');
+        captureCanvas.width  = localVideo.videoWidth  || 640;
+        captureCanvas.height = localVideo.videoHeight || 480;
+        captureCtx = captureCanvas.getContext('2d');
+
+        // 5. Update UI
+        videoSectionTitle.textContent = 'Live Classroom Feed';
+        startCameraBtn.style.display = 'none';
+        uploadVideoBtn.style.display = 'none';
+        stopCameraBtn.style.display = 'inline-flex';
+        stopCameraBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Camera';
+        videoPlaceholder.style.display = 'none';
+        videoFeed.style.display = 'block';
+        videoStats.style.display = 'flex';
+        videoProgress.style.display = 'none';
+
+        // 6. Start sending frames to backend every 250 ms
+        frameInterval = setInterval(sendFrameToBackend, 250);
+
+        // 7. Start stats polling
+        startStatsPolling();
+
+        showNotification(`New session started: ${data.session_id}`, 'success');
+
     } catch (error) {
         console.error('❌ Start camera error:', error);
+        // Clean up any partial state
+        _stopBrowserStream();
         alert(`Failed to start camera: ${error.message}`);
     } finally {
         startCameraBtn.disabled = false;
@@ -175,45 +205,102 @@ async function startCamera() {
 }
 
 /**
- * Stop camera
+ * Capture one frame from the browser webcam, POST it to /api/process_frame,
+ * and display the returned annotated frame in the <img> element.
+ */
+async function sendFrameToBackend() {
+    if (!cameraRunning || !localVideo || !captureCtx) return;
+
+    try {
+        // Draw current video frame onto canvas
+        captureCanvas.width  = localVideo.videoWidth  || 640;
+        captureCanvas.height = localVideo.videoHeight || 480;
+        captureCtx.drawImage(localVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+
+        // Get JPEG as base64 (quality 0.7 keeps payload small)
+        const b64 = captureCanvas.toDataURL('image/jpeg', 0.7);
+
+        const res = await fetch(`${API_BASE_URL}/process_frame`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ frame: b64 })
+        });
+
+        if (!res.ok) return;
+
+        const result = await res.json();
+        if (result.success && result.frame) {
+            // Display the AI-annotated frame returned by the server
+            videoFeed.src = `data:image/jpeg;base64,${result.frame}`;
+        }
+    } catch (err) {
+        // Silently ignore individual frame errors (network hiccup etc.)
+        console.debug('Frame send error:', err);
+    }
+}
+
+/**
+ * Internal helper — stop browser media stream and clear frame interval.
+ */
+function _stopBrowserStream() {
+    if (frameInterval) {
+        clearInterval(frameInterval);
+        frameInterval = null;
+    }
+    if (browserStream) {
+        browserStream.getTracks().forEach(t => t.stop());
+        browserStream = null;
+    }
+    if (localVideo) {
+        localVideo.srcObject = null;
+        localVideo = null;
+    }
+}
+
+/**
+ * Stop camera — stops browser stream and notifies backend.
  */
 async function stopCamera() {
     try {
         console.log('🛑 Stopping camera...');
         stopCameraBtn.disabled = true;
-        
+
+        // Stop browser webcam stream and frame sending
+        _stopBrowserStream();
+
         const response = await fetch(`${API_BASE_URL}/camera/stop`, {
             method: 'POST'
         });
-        
+
         const data = await response.json();
-        
+
         if (data.success) {
             console.log('✅ Camera stopped');
             cameraRunning = false;
             currentSessionId = null;
-            
+
             // Update UI
+            videoSectionTitle.textContent = 'Live Classroom Feed';
             startCameraBtn.style.display = 'inline-flex';
+            uploadVideoBtn.style.display = 'inline-flex';
             stopCameraBtn.style.display = 'none';
             videoPlaceholder.style.display = 'flex';
             videoFeed.style.display = 'none';
             videoStats.style.display = 'none';
             videoFeed.src = '';
-            
+
             // Stop stats polling
             stopStatsPolling();
-            
+
             // Reset stats display
             document.getElementById('statFps').textContent = '0';
             document.getElementById('statFaces').textContent = '0';
             document.getElementById('statStudents').textContent = '0';
             document.getElementById('statImages').textContent = '0';
-            
-            // Show success message
+
             showNotification('Camera stopped - session data preserved', 'info');
         }
-        
+
     } catch (error) {
         console.error('❌ Stop camera error:', error);
         alert(`Failed to stop camera: ${error.message}`);
@@ -223,23 +310,29 @@ async function stopCamera() {
 }
 
 /**
- * Check camera status
+ * Check camera status on page load.
+ * For browser-webcam mode we cannot auto-resume a stream without a user gesture,
+ * so we just reflect the server state in the UI without starting getUserMedia.
  */
 async function checkCameraStatus() {
     try {
         const response = await fetch(`${API_BASE_URL}/camera/status`);
         const data = await response.json();
-        
+
         if (data.success && data.status.running) {
-            // Camera is already running
-            cameraRunning = true;
-            startCameraBtn.style.display = 'none';
-            stopCameraBtn.style.display = 'inline-flex';
-            videoPlaceholder.style.display = 'none';
-            videoFeed.style.display = 'block';
-            videoStats.style.display = 'flex';
-            videoFeed.src = `${API_BASE_URL}/video_feed?t=${Date.now()}`;
-            startStatsPolling();
+            // A session is active server-side (e.g. video file processing)
+            // Only auto-resume the MJPEG stream for video-file sessions
+            if (data.status.is_video_file) {
+                cameraRunning = true;
+                startCameraBtn.style.display = 'none';
+                stopCameraBtn.style.display = 'inline-flex';
+                videoPlaceholder.style.display = 'none';
+                videoFeed.style.display = 'block';
+                videoStats.style.display = 'flex';
+                videoFeed.src = `${API_BASE_URL}/video_feed?t=${Date.now()}`;
+                startStatsPolling();
+            }
+            // For webcam sessions: leave UI in default state — user must click Start Camera
         }
     } catch (error) {
         console.log('Camera status check failed:', error);
@@ -950,56 +1043,74 @@ async function startVideoProcessing() {
 }
 
 /**
- * Update start camera to handle both webcam and video
+ * Start camera — browser-webcam version that also handles the video-upload flow.
+ * This overrides the earlier definition and is the one that actually runs.
  */
 async function startCamera() {
     try {
-        console.log('🎥 Starting new camera session...');
+        console.log('🎥 Starting new camera session (browser webcam)...');
         startCameraBtn.disabled = true;
-        
+
         // Reset dashboard for new session
         resetDashboard();
-        
+
+        // 1. Tell backend to initialise a session (browser_mode — no cv2.VideoCapture)
         const response = await fetch(`${API_BASE_URL}/camera/start`, {
             method: 'POST'
         });
-        
+
         const data = await response.json();
-        
-        if (data.success) {
-            console.log('✅ Camera started');
-            console.log('📁 Session ID:', data.session_id);
-            console.log('📁 Session Dir:', data.session_dir);
-            
-            cameraRunning = true;
-            sourceType = 'webcam';
-            currentSessionId = data.session_id;
-            
-            // Update UI
-            videoSectionTitle.textContent = 'Live Classroom Feed';
-            startCameraBtn.style.display = 'none';
-            uploadVideoBtn.style.display = 'none';
-            stopCameraBtn.style.display = 'inline-flex';
-            stopCameraBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Camera';
-            videoPlaceholder.style.display = 'none';
-            videoFeed.style.display = 'block';
-            videoStats.style.display = 'flex';
-            videoProgress.style.display = 'none';
-            
-            // Start video stream
-            videoFeed.src = `${API_BASE_URL}/video_feed?t=${Date.now()}`;
-            
-            // Start stats polling
-            startStatsPolling();
-            
-            // Show success message
-            showNotification(`New session started: ${data.session_id}`, 'success');
-        } else {
-            throw new Error(data.error || 'Failed to start camera');
+
+        if (!data.success) {
+            throw new Error(data.error || 'Failed to start camera session');
         }
-        
+
+        console.log('✅ Backend session started:', data.session_id);
+        cameraRunning = true;
+        sourceType = 'webcam';
+        currentSessionId = data.session_id;
+
+        // 2. Open browser webcam
+        browserStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false
+        });
+
+        // 3. Hidden video element to feed the canvas
+        localVideo = document.createElement('video');
+        localVideo.srcObject = browserStream;
+        localVideo.setAttribute('playsinline', '');
+        localVideo.muted = true;
+        await localVideo.play();
+
+        // 4. Capture canvas
+        captureCanvas = document.getElementById('captureCanvas');
+        captureCanvas.width  = localVideo.videoWidth  || 640;
+        captureCanvas.height = localVideo.videoHeight || 480;
+        captureCtx = captureCanvas.getContext('2d');
+
+        // 5. Update UI
+        videoSectionTitle.textContent = 'Live Classroom Feed';
+        startCameraBtn.style.display = 'none';
+        uploadVideoBtn.style.display = 'none';
+        stopCameraBtn.style.display = 'inline-flex';
+        stopCameraBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Camera';
+        videoPlaceholder.style.display = 'none';
+        videoFeed.style.display = 'block';
+        videoStats.style.display = 'flex';
+        videoProgress.style.display = 'none';
+
+        // 6. Start sending frames every 250 ms
+        frameInterval = setInterval(sendFrameToBackend, 250);
+
+        // 7. Stats polling
+        startStatsPolling();
+
+        showNotification(`New session started: ${data.session_id}`, 'success');
+
     } catch (error) {
         console.error('❌ Start camera error:', error);
+        _stopBrowserStream();
         alert(`Failed to start camera: ${error.message}`);
     } finally {
         startCameraBtn.disabled = false;
@@ -1007,26 +1118,29 @@ async function startCamera() {
 }
 
 /**
- * Update stop camera to handle both webcam and video
+ * Stop camera — stops browser stream + video processing and notifies backend.
  */
 async function stopCamera() {
     try {
         console.log('🛑 Stopping...');
         stopCameraBtn.disabled = true;
-        
+
+        // Always stop browser stream (no-op if not running)
+        _stopBrowserStream();
+
         const endpoint = videoProcessing ? '/video/stop' : '/camera/stop';
         const response = await fetch(`${API_BASE_URL}${endpoint}`, {
             method: 'POST'
         });
-        
+
         const data = await response.json();
-        
+
         if (data.success) {
             console.log('✅ Stopped');
             cameraRunning = false;
             videoProcessing = false;
             sourceType = null;
-            
+
             // Update UI
             videoSectionTitle.textContent = 'Live Classroom Feed';
             startCameraBtn.style.display = 'inline-flex';
@@ -1037,20 +1151,17 @@ async function stopCamera() {
             videoStats.style.display = 'none';
             videoProgress.style.display = 'none';
             videoFeed.src = '';
-            
-            // Stop stats polling
+
             stopStatsPolling();
-            
-            // Reset stats display
+
             document.getElementById('statFps').textContent = '0';
             document.getElementById('statFaces').textContent = '0';
             document.getElementById('statStudents').textContent = '0';
             document.getElementById('statImages').textContent = '0';
-            
-            // Show success message
+
             showNotification('Stopped - session data preserved', 'info');
         }
-        
+
     } catch (error) {
         console.error('❌ Stop error:', error);
         alert(`Failed to stop: ${error.message}`);
