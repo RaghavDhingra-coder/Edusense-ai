@@ -44,7 +44,8 @@ CORS(app, resources={
             "http://localhost:8080",
             "http://127.0.0.1:8080",
             "http://localhost:5000",
-            "http://127.0.0.1:5000"
+            "http://127.0.0.1:5000",
+            "http://0.0.0.0:8080"
         ],
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type"]
