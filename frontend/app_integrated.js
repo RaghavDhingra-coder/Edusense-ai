@@ -1,5 +1,5 @@
-// API Configuration
-const API_BASE_URL = 'http://localhost:8080/api';
+// API Configuration — use dynamic origin so this works both locally and on deployed VMs
+const API_BASE_URL = `${window.location.origin}/api`;
 
 // DOM Elements
 const startCameraBtn = document.getElementById('startCameraBtn');
