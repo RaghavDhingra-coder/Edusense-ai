@@ -28,8 +28,9 @@ class ImageManager:
         self.image_format = config.IMAGE_FORMAT
         self.image_quality = config.IMAGE_QUALITY
         
-        # Track last save time for each student
+        # Track last save time and frame counter for each student
         self.last_save_time = {}
+        self.save_counters = {}  # sequential per-student counter for unique filenames
         
         # Create base output directory
         self._create_base_directory()
@@ -63,23 +64,27 @@ class ImageManager:
             print(f"⚠️  Failed to create folder for student {student_id}: {str(e)}")
             return None
     
-    def should_save_image(self, track_id):
+    def should_save_image(self, track_id, current_time=None):
         """
-        Check if enough time has passed to save a new image for this student
-        
+        Check if enough time has passed to save a new image for this student.
+
         Args:
             track_id: Student tracking ID
-            
+            current_time: Timestamp to compare against. Pass video-clock seconds for
+                          video files so the interval is measured in video-time rather
+                          than wall-clock time (avoids too-few images when the video is
+                          processed faster than real-time).
+
         Returns:
             True if image should be saved, False otherwise
         """
-        current_time = time.time()
-        
+        if current_time is None:
+            current_time = time.time()
+
         if track_id not in self.last_save_time:
             return True
-        
-        time_elapsed = current_time - self.last_save_time[track_id]
-        return time_elapsed >= self.save_interval
+
+        return (current_time - self.last_save_time[track_id]) >= self.save_interval
     
     def crop_face(self, frame, bbox):
         """
@@ -169,65 +174,72 @@ class ImageManager:
         
         return True
     
-    def save_face_image(self, frame, bbox, track_id, confidence):
+    def save_face_image(self, frame, bbox, track_id, confidence, current_time=None):
         """
-        Save face crop with strict validation
-        Only saves if: confidence > threshold, size > minimum, crop is valid
-        
+        Save face crop with strict validation.
+        Only saves if: confidence > threshold, size > minimum, crop is valid.
+
         Args:
             frame: Input frame
             bbox: Bounding box (x1, y1, x2, y2)
             track_id: Student tracking ID
             confidence: Detection confidence
-            
+            current_time: Optional timestamp override (pass video-clock seconds for
+                          video files so save interval is measured in video-time, not
+                          wall-clock time — avoids too-few images when video is
+                          processed faster than real-time).
+
         Returns:
             True if saved successfully, False otherwise
         """
         # Check if we should save based on time interval
-        if not self.should_save_image(track_id):
+        if not self.should_save_image(track_id, current_time):
             return False
-        
+
         # Validate confidence threshold
         if confidence < config.CONFIDENCE_THRESHOLD:
             return False
-        
+
         # Validate bbox dimensions
         x1, y1, x2, y2 = bbox
         width = x2 - x1
         height = y2 - y1
-        
+
         if width < config.MIN_FACE_WIDTH or height < config.MIN_FACE_HEIGHT:
             return False
-        
+
         # Crop face with tight bounds
         face_crop = self.crop_face(frame, bbox)
         if face_crop is None:
             return False
-        
+
         # Validate the crop is a proper face
         if not self.validate_face_crop(face_crop):
             return False
-        
+
         # Create student folder
         student_folder = self.create_student_folder(track_id)
         if student_folder is None:
             return False
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"{timestamp}.{self.image_format}"
+
+        # Unique sequential filename — avoids collisions when the video is
+        # processed faster than real-time (multiple frames share the same
+        # wall-clock second and would otherwise overwrite each other).
+        count = self.save_counters.get(track_id, 0)
+        self.save_counters[track_id] = count + 1
+        filename = f"frame_{count:06d}.{self.image_format}"
         filepath = os.path.join(student_folder, filename)
-        
+
         # Save image
         try:
             if self.image_format.lower() in ['jpg', 'jpeg']:
                 cv2.imwrite(filepath, face_crop, [cv2.IMWRITE_JPEG_QUALITY, self.image_quality])
             else:
                 cv2.imwrite(filepath, face_crop)
-            
-            # Update last save time
-            self.last_save_time[track_id] = time.time()
-            
+
+            # Record the time of this save (use provided timestamp for video-time accounting)
+            self.last_save_time[track_id] = current_time if current_time is not None else time.time()
+
             return True
         except Exception as e:
             print(f"⚠️  Failed to save image for student {track_id}: {str(e)}")

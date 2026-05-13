@@ -261,10 +261,10 @@ class CameraSystem:
                 if self.is_video_file:
                     # Get video properties
                     self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video_fps = self.cap.get(cv2.CAP_PROP_FPS)
+                    self.video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
                     width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    logger.info(f"[VIDEO] ✅ Video opened: {width}x{height}, {video_fps:.1f} FPS, {self.total_frames} frames")
+                    logger.info(f"[VIDEO] ✅ Video opened: {width}x{height}, {self.video_fps:.1f} FPS, {self.total_frames} frames")
                 else:
                     logger.info("[CAMERA] ✅ Camera opened successfully")
                     # Set camera properties
@@ -392,7 +392,17 @@ class CameraSystem:
         """
         self.frame_number += 1
         current_time = time.time()
-        
+
+        # For video files, measure the save interval in video-clock seconds (not
+        # wall-clock seconds) so the number of saved images scales with video
+        # duration rather than processing speed.  Without this, a 100 fps video
+        # processed faster than real-time produces far fewer images than a 30 fps
+        # video of the same length.
+        if self.is_video_file and getattr(self, 'video_fps', 0) > 0:
+            save_timestamp = self.frame_number / self.video_fps
+        else:
+            save_timestamp = None  # ImageManager falls back to time.time()
+
         # Debug for first frames
         debug = self.frame_number <= 50
         
@@ -436,7 +446,7 @@ class CameraSystem:
                         logger.info(f"✅ Recognized: {student_name} (Track {track_id})")
                     
                     # ONLY save face image for registered students
-                    self.image_manager.save_face_image(frame, bbox, student_id, confidence)
+                    self.image_manager.save_face_image(frame, bbox, student_id, confidence, save_timestamp)
                     
                     # Store for display with name
                     reid_detections.append((x1, y1, x2, y2, student_id, confidence, student_name, True))
@@ -452,7 +462,7 @@ class CameraSystem:
             else:
                 # No ReID - use track ID
                 student_id = track_id
-                self.image_manager.save_face_image(frame, bbox, student_id, confidence)
+                self.image_manager.save_face_image(frame, bbox, student_id, confidence, save_timestamp)
                 reid_detections.append((x1, y1, x2, y2, student_id, confidence, f"Student {student_id}", True))
         
         # Handle lost tracks - SAME AS main.py

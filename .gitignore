@@ -121,3 +121,5 @@ $RECYCLE.BIN/
 tmp/
 temp/
 *.tmp
+**/*.jpg
+**/*.pkl
