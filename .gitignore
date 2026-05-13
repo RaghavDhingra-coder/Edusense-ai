@@ -121,3 +121,7 @@ $RECYCLE.BIN/
 tmp/
 temp/
 *.tmp
+
+# Markdown files
+*.md
+!README.md
